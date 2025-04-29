@@ -1,0 +1,518 @@
+---
+title: "Store Sales Forecasting"
+subtitle: "Kaggle Competition"
+format:
+  html:
+    toc: true
+    embed-resources: true
+execute:
+  echo: true
+  eval: false
+---
+
+```{r}
+#| label: pkgs
+#| message: false
+#| warning: false
+
+library(conflicted)
+library(kaggler)
+library(tidyverse)
+library(tsibble)
+library(feasts)
+library(fable)
+library(fable.prophet)
+library(ggplot2)
+library(readr)
+library(dplyr)
+library(shiny)
+library(tsibble)
+library(plotly)
+library(scales)
+
+conflicts_prefer(
+  lubridate::date(),
+  dplyr::filter()
+)
+```
+
+```{r}
+comp_id <- "store-sales-time-series-forecasting"
+```
+
+# Data import
+
+## `train.csv`
+
+### Convert to a `tsibble`
+
+```{r}
+#| label: train
+train_tsbl <- read_csv("train.csv", 
+                       show_col_types = FALSE) |> 
+  as_tsibble(index = date, key = c(store_nbr, family)) |> 
+  select(-onpromotion)
+
+train_tsbl
+```
+
+### Checking for gaps
+
+```{r}
+train_tsbl |> 
+  has_gaps()
+```
+
+All of them have implicit gaps in time. Below we'll find where are such gaps:
+
+```{r}
+gaps <- train_tsbl |> 
+  count_gaps(.full = TRUE) |> 
+  distinct(.from)
+
+gaps
+```
+
+It's Christmas. We'll fill the implicit gaps and set to zero its value.
+
+```{r}
+#| label: fill_gaps
+train_tsbl <- train_tsbl |> 
+  fill_gaps(.full = TRUE, 
+            sales = 0L)
+
+train_tsbl
+```
+
+## Additional data
+
+## `holidays_events.csv`
+
+```{r}
+holidays <- read_csv("holidays_events.csv", show_col_types = FALSE)
+holidays
+```
+
+### `stores.csv`
+
+```{r}
+stores <- read_csv("stores.csv", show_col_types = FALSE)
+stores
+```
+
+```{r}
+stores |> 
+  distinct(state)
+```
+
+**NOTA: Todos los estados son de ecuador**
+
+### `oil.csv`
+
+```{r}
+oil <- read_csv("oil.csv", show_col_types = FALSE) |> 
+  as_tsibble(index = date) |> 
+  fill_gaps(.full = TRUE) |> 
+  fill(dcoilwtico, .direction = "downup")
+oil 
+```
+
+### Joining the data in one `tsibble`
+
+```{r}
+train_tsbl <- train_tsbl |> 
+  left_join(oil, by = "date")
+train_tsbl
+```
+
+### `test.csv`
+
+```{r}
+test <- read_csv("test.csv", show_col_types = FALSE) |> 
+  select(-onpromotion)
+test
+```
+
+# Exploratory analysis
+
+## Products with no sales
+
+We'll check if there are any family products not being sold in specific stores:
+
+```{r}
+ceros <- train_tsbl |> 
+  as_tibble() |> 
+  group_by(store_nbr, family) |> 
+  summarise(sales = sum(sales), .groups = "drop") |> 
+  filter(sales == 0) |> 
+  select(-sales)
+
+ceros
+```
+
+There are with no sales in the training set. We'll use a **NAIVE** model to forecast them.The time series that do have sales will be stored in `series_tsbl`:
+
+```{r}
+series_tsbl <- train_tsbl |> 
+  anti_join(ceros, by = c("store_nbr", "family"))
+
+series_tsbl
+```
+
+and the ones without sales in `series_ceros`:
+
+```{r}
+series_ceros <- train_tsbl |> 
+  anti_join(series_tsbl, by = c("date", "store_nbr", "family"))
+series_ceros
+```
+
+The forecasts for such series are done below:
+
+```{r}
+series_ceros_fit <- series_ceros |> 
+  model(naive = NAIVE(sales))
+series_ceros_fit
+
+series_ceros_fcst <- series_ceros_fit |> 
+  forecast(h = 16)
+
+series_ceros_fcst
+```
+
+# Intento de Regresión Lineal
+
+## Añadimos features
+
+```{r}
+test_enriched <- test |> 
+  left_join(oil, by = "date") |> 
+  left_join(holidays, by = "date") |> 
+  left_join(stores, by = "store_nbr") |> 
+  mutate(store_nbr = as.integer(store_nbr))
+
+test_tsbl <- test_enriched |> 
+  as_tsibble(index = date, key = c(store_nbr, family)) |> 
+  mutate(type.x = replace_na(type.x, "None")) |> 
+  mutate(festivo = if_else(type.x == "None", FALSE, TRUE))
+
+test_tsbl
+```
+
+```{r}
+# Test para series normales
+test_tsbl_normal <- test_tsbl |> 
+  anti_join(ceros, by = c("store_nbr", "family"))
+
+# Test para series de ventas cero
+test_tsbl_ceros <- test_tsbl |> 
+  semi_join(ceros, by = c("store_nbr", "family"))
+
+test_tsbl_ceros
+```
+
+```{r}
+tictoc::tic()
+series_tsbl_fit <- train_tsbl |> 
+  model(
+    tslm = TSLM(sales ~ dcoilwtico + festivo)
+  )
+tictoc::toc()
+
+series_tsbl_fit
+```
+
+Medir presición
+
+```{r}
+tictoc::tic()
+accuracy(series_tsbl_fit)
+tictoc::toc()
+```
+
+## Forecast
+
+Forecast para series normales
+
+```{r}
+series_tsbl_fcst <- series_tsbl_fit |> 
+  forecast(new_data = test_tsbl)
+
+series_tsbl_fcst
+```
+
+Forecast para series ceros (ventas = 0 manualmente):
+
+```{r}
+series_ceros_fcst <- test_tsbl_ceros |> 
+  mutate(.mean = 0)
+
+series_ceros_fcst
+```
+
+```{r}
+full_fcst <- bind_rows(series_tsbl_fcst, series_ceros_fcst)
+
+full_fcst
+```
+
+# Mejor modelo: Combinado
+
+```{r}
+series_tsbl_fit <- series_tsbl |> 
+  model(
+    comb = combination_model(
+      prophet(sales),
+      ETS(sales),
+      ARIMA(sales)
+      )
+    )
+```
+
+# Segundo Mejor Modelo: Filtrado
+
+Obtenemos los features STL y ARIMA
+
+```{r}
+acf_features <- series_tsbl |> features(sales, feat_acf)
+stl_features <- series_tsbl |> features(sales, feat_stl)
+
+series_features <- left_join(acf_features, stl_features, by = c("store_nbr", "family"))
+
+series_features
+```
+
+## Filtrado de Series
+
+Eliminamos colas de 0s de aquellas series en donde productos no fueron introducidos hasta x fecha
+
+```{r}
+primera_venta <- series_tsbl |>
+  filter(sales > 0) |>
+  distinct(store_nbr, family, .keep_all = TRUE) |>
+  group_by(store_nbr, family) |>
+  summarise(first_sale_date = min(date), .groups = "drop")
+
+series_tsbl <- series_tsbl |>
+  left_join(primera_venta, by = c("store_nbr", "family")) |>
+  filter(date >= first_sale_date) |>
+  select(-first_sale_date)
+```
+
+Unimos fariables exógenas al train y test set
+
+```{r}
+feriados <- holidays |>
+  distinct(date) |>
+  mutate(is_holiday = TRUE)
+
+series_tsbl <- series_tsbl |>
+  left_join(feriados, by = "date") |>
+  mutate(is_holiday = ifelse(is.na(is_holiday), FALSE, is_holiday))
+
+# Test
+
+test_enriched <- test |> 
+  left_join(oil, by = "date") |> 
+  mutate(store_nbr = as.integer(store_nbr))
+
+test_enriched <- test_enriched |>
+  left_join(feriados, by = "date") |>
+  mutate(is_holiday = ifelse(is.na(is_holiday), FALSE, is_holiday))
+
+test_tsbl <- test_enriched |> 
+  as_tsibble(index = date, key = c(store_nbr, family))
+```
+
+```{r}
+# Test para series normales
+test_tsbl_normal <- test_tsbl |> 
+  anti_join(ceros, by = c("store_nbr", "family"))
+
+# Test para series de ventas cero
+test_tsbl_ceros <- test_tsbl |> 
+  semi_join(ceros, by = c("store_nbr", "family"))
+```
+
+Filtramos las series
+
+```{r}
+series_fourier <- filter(series_features, acf1 > 0.5 & seasonal_strength_week > 0.5) |> 
+  select(store_nbr, family)
+
+series_arima <- anti_join(series_features, series_fourier, by = c("store_nbr", "family")) |> 
+  filter(acf1 > 0.5) |> 
+  select(store_nbr, family)
+
+series_reg <- anti_join(series_features, bind_rows(series_arima, series_fourier), by = c("store_nbr", "family")) |> 
+  filter(linearity > 0.5 & trend_strength > 0.5 & seasonal_strength_week < 0.5 & spikiness < 0.5) |> 
+  select(store_nbr, family)
+
+series_prophet <- anti_join(series_features, bind_rows(series_fourier, series_reg, series_arima), by = c("store_nbr", "family")) |> 
+  filter(trend_strength > 0.5 & seasonal_strength_week > 0.5, spikiness < 0.5) |> 
+  select(store_nbr, family)
+
+series_stl <- anti_join(series_features, bind_rows(series_fourier, series_reg, series_arima, series_prophet), by = c("store_nbr", "family")) |> 
+  filter(linearity > 0.5 & trend_strength > 0.5 & seasonal_strength_week > 0.5) |> 
+  select(store_nbr, family)
+
+series_ets <- anti_join(series_features, bind_rows(series_fourier, series_reg, series_arima, series_prophet, series_stl), by = c("store_nbr", "family")) |> 
+  filter(trend_strength > 0.5 & seasonal_strength_week > 0.5) |> 
+  select(store_nbr, family)
+
+series_gen <- anti_join(series_features, bind_rows(series_fourier, series_reg, series_stl, series_arima, series_ets, series_prophet), by = c("store_nbr", "family")) |> 
+  select(store_nbr, family)
+```
+
+```{r}
+series_clasificadas <- bind_rows(
+  series_stl,
+  series_fourier,
+  series_arima,
+  series_ets,
+  series_reg,
+  series_prophet,
+  series_gen
+)
+
+n_series_total <- nrow(distinct(series_tsbl, store_nbr, family))
+n_series_clasificadas <- nrow(series_clasificadas)
+
+n_series_total == n_series_clasificadas
+```
+
+## Modelado y Forecast para cada subconjunto
+
+```{r}
+bind_rows(
+  series_stl |> mutate(modelo = "STL"),
+  series_arima |> mutate(modelo = "ARIMA"),
+  series_ets |> mutate(modelo = "ETS"),
+  series_fourier |> mutate(modelo = "FOURIER"),
+  series_prophet |> mutate(modelo = "PROPHET"),
+  series_reg |> mutate(modelo = "REGRESION"),
+  series_gen |> mutate(modelo = "GENERAL")
+) |>
+  distinct() |>
+  count(modelo, name = "n_series")
+```
+
+```{r}
+#| warning: false
+series_reg_tsbl <- semi_join(series_tsbl, series_reg, by = c("store_nbr", "family"))
+
+reg_fit <- series_reg_tsbl |> 
+  model(tslm = TSLM(sales ~ dcoilwtico + is_holiday))
+
+test_reg <- semi_join(test_tsbl_normal, series_reg, by = c("store_nbr", "family"))
+
+reg_fcst <- forecast(reg_fit, new_data = test_reg)
+```
+
+```{r}
+#| warning: false
+series_prophet_tsbl <- semi_join(series_tsbl, series_prophet, by = c("store_nbr", "family"))
+
+prophet_fit <- series_prophet_tsbl |> 
+  model(prophet = prophet(sales))
+
+prophet_fcst <- forecast(prophet_fit, h = 16)
+```
+
+```{r}
+#| warning: false
+series_fourier_tsbl <- semi_join(series_tsbl, series_fourier, by = c("store_nbr", "family"))
+
+fourier_fit <- series_fourier_tsbl |> 
+  model(fourier = ARIMA(sales ~ fourier(K = 2) + PDQ(0,0,0)))
+
+fourier_fcst <- forecast(fourier_fit, h = 16)
+```
+
+```{r}
+#| warning: false
+series_stl_tsbl <- semi_join(series_tsbl, series_stl, by = c("store_nbr", "family"))
+
+stl_fit <- series_stl_tsbl |> model(
+  stl = decomposition_model(
+    STL(sales ~ season(), robust = TRUE),
+    RW(season_adjust ~ drift())
+  )
+)
+
+stl_fcst <- forecast(stl_fit, h = 16)
+```
+
+```{r}
+#| warning: false
+series_arima_tsbl <- semi_join(series_tsbl, series_arima, by = c("store_nbr", "family"))
+
+arima_fit <- series_arima_tsbl |> 
+  model(arima = ARIMA(sales))
+
+arima_fcst <- forecast(arima_fit, h = 16)
+```
+
+```{r}
+#| warning: false
+series_ets_tsbl <- semi_join(series_tsbl, series_ets, by = c("store_nbr", "family"))
+
+ets_fit <- series_ets_tsbl |> 
+  model(ets = ETS(sales))
+
+ets_fcst <- forecast(ets_fit, h = 16)
+```
+
+```{r}
+#| warning: false
+series_gen_tsbl <- semi_join(series_tsbl, series_gen, by = c("store_nbr", "family"))
+
+gen_fit <- series_gen_tsbl |> 
+  model(gen = combination_model(
+    prophet(sales),
+    ETS(sales),
+    ARIMA(sales)
+  )
+  )
+
+gen_fcst <- forecast(gen_fit, h = 16)
+```
+
+## Juntar todos los Forecasts
+
+```{r}
+full_fcst <- bind_rows(
+  stl_fcst,
+  arima_fcst,
+  prophet_fcst,
+  ets_fcst,
+  gen_fcst,
+  reg_fcst,
+  fourier_fcst,
+  series_ceros_fcst
+)
+
+full_fcst
+```
+
+```{r}
+sum(is.na(full_fcst$.mean))
+```
+
+# Submissions
+
+```{r}
+submission <- full_fcst |> 
+  left_join(test, by = c("date", "store_nbr", "family")) |> 
+  as_tibble() |>
+  select(id.y, .mean) |>
+  rename(sales = .mean)
+
+submission <- submission |>
+  rename(id = id.y)
+
+submission |> 
+  write_csv("submission_12.csv")
+
+submission
+```
