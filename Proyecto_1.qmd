@@ -63,7 +63,7 @@ train_tsbl |>
   has_gaps()
 ```
 
-All of them have implicit gaps in time. Below we'll find where are such gaps:
+All of them have implicit gaps in time. Below we will find where are such gaps:
 
 ```{r}
 gaps <- train_tsbl |> 
